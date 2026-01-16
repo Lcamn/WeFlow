@@ -1024,26 +1024,32 @@ class ExportService {
           // 群消息
           senderWxid = msg.senderUsername
           
-          // 用 getContactInfo 获取正确的显示名（昵称）
-          const senderInfo = await this.getContactInfo(msg.senderUsername)
-          senderNickname = senderInfo.displayName || msg.senderUsername
-          
-          // 用 getContact 获取备注
+          // 用 getContact 获取联系人详情，分别取昵称和备注
           const contactDetail = await wcdbService.getContact(msg.senderUsername)
-          if (contactDetail.success && contactDetail.contact && contactDetail.contact.remark) {
-            senderRemark = contactDetail.contact.remark
+          if (contactDetail.success && contactDetail.contact) {
+            // nickName 才是真正的昵称
+            senderNickname = contactDetail.contact.nickName || msg.senderUsername
+            senderRemark = contactDetail.contact.remark || ''
             // 身份：有备注显示备注，没有显示昵称
-            senderRole = contactDetail.contact.remark
+            senderRole = senderRemark || senderNickname
           } else {
+            senderNickname = msg.senderUsername
+            senderRemark = ''
+            senderRole = msg.senderUsername
+          }
+        } else {
+          // 单聊对方消息 - 用 getContact 获取联系人详情
+          senderWxid = sessionId
+          const contactDetail = await wcdbService.getContact(sessionId)
+          if (contactDetail.success && contactDetail.contact) {
+            senderNickname = contactDetail.contact.nickName || sessionId
+            senderRemark = contactDetail.contact.remark || ''
+            senderRole = senderRemark || senderNickname
+          } else {
+            senderNickname = sessionInfo.displayName || sessionId
             senderRemark = ''
             senderRole = senderNickname
           }
-        } else {
-          // 单聊对方消息
-          senderRole = sessionInfo.displayName || sessionId
-          senderWxid = sessionId
-          senderNickname = sessionInfo.displayName || sessionId
-          senderRemark = ''
         }
 
         const row = worksheet.getRow(currentRow)
