@@ -1,5 +1,5 @@
 import { join, dirname } from 'path'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { app } from 'electron'
 
 export interface ContactCacheEntry {
@@ -15,7 +15,7 @@ export class ContactCacheService {
   constructor(cacheBasePath?: string) {
     const basePath = cacheBasePath && cacheBasePath.trim().length > 0
       ? cacheBasePath
-      : join(app.getPath('userData'), 'WeFlowCache')
+      : join(app.getPath('documents'), 'WeFlow')
     this.cacheFilePath = join(basePath, 'contacts.json')
     this.ensureCacheDir()
     this.loadCache()
@@ -70,6 +70,15 @@ export class ContactCacheService {
       writeFileSync(this.cacheFilePath, JSON.stringify(this.cache), 'utf8')
     } catch (error) {
       console.error('ContactCacheService: 保存缓存失败', error)
+    }
+  }
+
+  clear(): void {
+    this.cache = {}
+    try {
+      rmSync(this.cacheFilePath, { force: true })
+    } catch (error) {
+      console.error('ContactCacheService: 清理缓存失败', error)
     }
   }
 }

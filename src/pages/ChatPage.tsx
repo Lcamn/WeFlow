@@ -5,7 +5,21 @@ import { useChatStore } from '../stores/chatStore'
 import type { ChatSession, Message } from '../types/models'
 import { getEmojiPath } from 'wechat-emojis'
 import { ImagePreview } from '../components/ImagePreview'
+import { VoiceTranscribeDialog } from '../components/VoiceTranscribeDialog'
+import { AnimatedStreamingText } from '../components/AnimatedStreamingText'
+import * as configService from '../services/config'
 import './ChatPage.scss'
+
+// 系统消息类型常量
+const SYSTEM_MESSAGE_TYPES = [
+  10000,        // 系统消息
+  266287972401, // 拍一拍
+]
+
+// 判断是否为系统消息
+function isSystemMessage(localType: number): boolean {
+  return SYSTEM_MESSAGE_TYPES.includes(localType)
+}
 
 interface ChatPageProps {
   // 保留接口以备将来扩展
@@ -138,6 +152,8 @@ function ChatPage(_props: ChatPageProps) {
   const [highlightedMessageKeys, setHighlightedMessageKeys] = useState<string[]>([])
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false)
   const [hasInitialMessages, setHasInitialMessages] = useState(false)
+  const [showVoiceTranscribeDialog, setShowVoiceTranscribeDialog] = useState(false)
+  const [pendingVoiceTranscriptRequest, setPendingVoiceTranscriptRequest] = useState<{ sessionId: string; messageId: string } | null>(null)
 
   // 联系人信息加载控制
   const isEnrichingRef = useRef(false)
@@ -971,6 +987,11 @@ function ChatPage(_props: ChatPageProps) {
     })
   }
 
+  const handleRequireModelDownload = useCallback((sessionId: string, messageId: string) => {
+    setPendingVoiceTranscriptRequest({ sessionId, messageId })
+    setShowVoiceTranscribeDialog(true)
+  }, [])
+
   return (
     <div className={`chat-page ${isResizing ? 'resizing' : ''}`}>
       {/* 左侧会话列表 */}
@@ -1128,10 +1149,10 @@ function ChatPage(_props: ChatPageProps) {
                   const prevMsg = index > 0 ? messages[index - 1] : undefined
                   const showDateDivider = shouldShowDateDivider(msg, prevMsg)
 
-                  // 显示时间：第一条消息，或者与上一条消息间隔超过5分钟
+                  // 显示时间:第一条消息,或者与上一条消息间隔超过5分钟
                   const showTime = !prevMsg || (msg.createTime - prevMsg.createTime > 300)
                   const isSent = msg.isSend === 1
-                  const isSystem = msg.localType === 10000
+                  const isSystem = isSystemMessage(msg.localType)
 
                   // 系统消息居中显示
                   const wrapperClass = isSystem ? 'system' : (isSent ? 'sent' : 'received')
@@ -1150,6 +1171,7 @@ function ChatPage(_props: ChatPageProps) {
                         showTime={!showDateDivider && showTime}
                         myAvatarUrl={myAvatarUrl}
                         isGroupChat={isGroupChat(currentSession.username)}
+                        onRequireModelDownload={handleRequireModelDownload}
                       />
                     </div>
                   )
@@ -1272,6 +1294,31 @@ function ChatPage(_props: ChatPageProps) {
           </div>
         )}
       </div>
+
+      {/* 语音转文字模型下载弹窗 */}
+      {showVoiceTranscribeDialog && (
+        <VoiceTranscribeDialog
+          onClose={() => {
+            setShowVoiceTranscribeDialog(false)
+            setPendingVoiceTranscriptRequest(null)
+          }}
+          onDownloadComplete={async () => {
+            setShowVoiceTranscribeDialog(false)
+            // 下载完成后，触发页面刷新让组件重新尝试转写
+            // 通过更新缓存触发组件重新检查
+            if (pendingVoiceTranscriptRequest) {
+              // 清除缓存中的请求标记，让组件可以重新尝试
+              const cacheKey = `voice-transcript:${pendingVoiceTranscriptRequest.messageId}`
+              // 不直接调用转写，而是让组件自己重试
+              // 通过触发一个自定义事件来通知所有 MessageBubble 组件
+              window.dispatchEvent(new CustomEvent('model-downloaded', {
+                detail: { messageId: pendingVoiceTranscriptRequest.messageId }
+              }))
+            }
+            setPendingVoiceTranscriptRequest(null)
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -1280,18 +1327,20 @@ function ChatPage(_props: ChatPageProps) {
 const emojiDataUrlCache = new Map<string, string>()
 const imageDataUrlCache = new Map<string, string>()
 const voiceDataUrlCache = new Map<string, string>()
+const voiceTranscriptCache = new Map<string, string>()
 const senderAvatarCache = new Map<string, { avatarUrl?: string; displayName?: string }>()
 const senderAvatarLoading = new Map<string, Promise<{ avatarUrl?: string; displayName?: string } | null>>()
 
 // 消息气泡组件
-function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat }: {
+function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat, onRequireModelDownload }: {
   message: Message;
   session: ChatSession;
   showTime?: boolean;
   myAvatarUrl?: string;
   isGroupChat?: boolean;
+  onRequireModelDownload?: (sessionId: string, messageId: string) => void;
 }) {
-  const isSystem = message.localType === 10000
+  const isSystem = isSystemMessage(message.localType)
   const isEmoji = message.localType === 47
   const isImage = message.localType === 3
   const isVoice = message.localType === 34
@@ -1306,11 +1355,30 @@ function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat }:
   const [imageClicked, setImageClicked] = useState(false)
   const imageUpdateCheckedRef = useRef<string | null>(null)
   const imageClickTimerRef = useRef<number | null>(null)
+  const imageContainerRef = useRef<HTMLDivElement>(null)
+  const imageAutoDecryptTriggered = useRef(false)
   const [voiceError, setVoiceError] = useState(false)
   const [voiceLoading, setVoiceLoading] = useState(false)
   const [isVoicePlaying, setIsVoicePlaying] = useState(false)
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null)
+  const [voiceTranscriptLoading, setVoiceTranscriptLoading] = useState(false)
+  const [voiceTranscriptError, setVoiceTranscriptError] = useState(false)
+  const voiceTranscriptRequestedRef = useRef(false)
   const [showImagePreview, setShowImagePreview] = useState(false)
+  const [autoTranscribeVoice, setAutoTranscribeVoice] = useState(true)
+  const [voiceCurrentTime, setVoiceCurrentTime] = useState(0)
+  const [voiceDuration, setVoiceDuration] = useState(0)
+  const [voiceWaveform, setVoiceWaveform] = useState<number[]>([])
+  const voiceAutoDecryptTriggered = useRef(false)
+
+  // 加载自动转文字配置
+  useEffect(() => {
+    const loadConfig = async () => {
+      const enabled = await configService.getAutoTranscribeVoice()
+      setAutoTranscribeVoice(enabled)
+    }
+    loadConfig()
+  }, [])
 
   // 从缓存获取表情包 data URL
   const cacheKey = message.emojiMd5 || message.emojiCdnUrl || ''
@@ -1324,6 +1392,10 @@ function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat }:
   const voiceCacheKey = `voice:${message.localId}`
   const [voiceDataUrl, setVoiceDataUrl] = useState<string | undefined>(
     () => voiceDataUrlCache.get(voiceCacheKey)
+  )
+  const voiceTranscriptCacheKey = `voice-transcript:${message.localId}`
+  const [voiceTranscript, setVoiceTranscript] = useState<string | undefined>(
+    () => voiceTranscriptCache.get(voiceTranscriptCacheKey)
   )
 
   const formatTime = (timestamp: number): string => {
@@ -1555,6 +1627,31 @@ function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat }:
     }
   }, [isImage, imageCacheKey, message.imageDatName, message.imageMd5])
 
+  // 图片进入视野前自动解密（懒加载）
+  useEffect(() => {
+    if (!isImage) return
+    if (imageLocalPath) return // 已有图片，不需要解密
+    if (!message.imageMd5 && !message.imageDatName) return
+
+    const container = imageContainerRef.current
+    if (!container) return
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0]
+        // rootMargin 设置为 200px，提前触发解密
+        if (entry.isIntersecting && !imageAutoDecryptTriggered.current) {
+          imageAutoDecryptTriggered.current = true
+          void requestImageDecrypt()
+        }
+      },
+      { rootMargin: '200px', threshold: 0 }
+    )
+
+    observer.observe(container)
+    return () => observer.disconnect()
+  }, [isImage, imageLocalPath, message.imageMd5, message.imageDatName, requestImageDecrypt])
+
 
   useEffect(() => {
     if (!isVoice) return
@@ -1565,17 +1662,191 @@ function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat }:
     if (!audio) return
     const handlePlay = () => setIsVoicePlaying(true)
     const handlePause = () => setIsVoicePlaying(false)
-    const handleEnded = () => setIsVoicePlaying(false)
+    const handleEnded = () => {
+      setIsVoicePlaying(false)
+      setVoiceCurrentTime(0)
+    }
+    const handleTimeUpdate = () => {
+      setVoiceCurrentTime(audio.currentTime)
+    }
+    const handleLoadedMetadata = () => {
+      setVoiceDuration(audio.duration)
+    }
     audio.addEventListener('play', handlePlay)
     audio.addEventListener('pause', handlePause)
     audio.addEventListener('ended', handleEnded)
+    audio.addEventListener('timeupdate', handleTimeUpdate)
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata)
     return () => {
       audio.pause()
       audio.removeEventListener('play', handlePlay)
       audio.removeEventListener('pause', handlePause)
       audio.removeEventListener('ended', handleEnded)
+      audio.removeEventListener('timeupdate', handleTimeUpdate)
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata)
     }
   }, [isVoice])
+
+  // 生成波形数据
+  useEffect(() => {
+    if (!voiceDataUrl) {
+      setVoiceWaveform([])
+      return
+    }
+
+    const generateWaveform = async () => {
+      try {
+        // 从 data:audio/wav;base64,... 提取 base64
+        const base64 = voiceDataUrl.split(',')[1]
+        const binaryString = window.atob(base64)
+        const bytes = new Uint8Array(binaryString.length)
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i)
+        }
+
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+        const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer)
+        const rawData = audioBuffer.getChannelData(0) // 获取单声道数据
+        const samples = 35 // 波形柱子数量
+        const blockSize = Math.floor(rawData.length / samples)
+        const filteredData: number[] = []
+
+        for (let i = 0; i < samples; i++) {
+          let blockStart = blockSize * i
+          let sum = 0
+          for (let j = 0; j < blockSize; j++) {
+            sum = sum + Math.abs(rawData[blockStart + j])
+          }
+          filteredData.push(sum / blockSize)
+        }
+
+        // 归一化
+        const multiplier = Math.pow(Math.max(...filteredData), -1)
+        const normalizedData = filteredData.map(n => n * multiplier)
+        setVoiceWaveform(normalizedData)
+        void audioCtx.close()
+      } catch (e) {
+        console.error('Failed to generate waveform:', e)
+        // 降级：生成随机但平滑的波形
+        setVoiceWaveform(Array.from({ length: 35 }, () => 0.2 + Math.random() * 0.8))
+      }
+    }
+
+    void generateWaveform()
+  }, [voiceDataUrl])
+
+  // 消息加载时自动检测语音缓存
+  useEffect(() => {
+    if (!isVoice || voiceDataUrl) return
+    window.electronAPI.chat.resolveVoiceCache(session.username, String(message.localId))
+      .then(result => {
+        if (result.success && result.hasCache && result.data) {
+          const url = `data:audio/wav;base64,${result.data}`
+          voiceDataUrlCache.set(voiceCacheKey, url)
+          setVoiceDataUrl(url)
+        }
+      })
+  }, [isVoice, message.localId, session.username, voiceCacheKey, voiceDataUrl])
+
+  // 监听流式转写结果
+  useEffect(() => {
+    if (!isVoice) return
+    const removeListener = window.electronAPI.chat.onVoiceTranscriptPartial?.((payload: { msgId: string; text: string }) => {
+      if (payload.msgId === String(message.localId)) {
+        setVoiceTranscript(payload.text)
+        voiceTranscriptCache.set(voiceTranscriptCacheKey, payload.text)
+      }
+    })
+    return () => removeListener?.()
+  }, [isVoice, message.localId, voiceTranscriptCacheKey])
+
+  const requestVoiceTranscript = useCallback(async () => {
+    if (voiceTranscriptLoading || voiceTranscriptRequestedRef.current) return
+
+    // 检查 whisper API 是否可用
+    if (!window.electronAPI?.whisper?.getModelStatus) {
+      console.warn('[ChatPage] whisper API 不可用')
+      setVoiceTranscriptError(true)
+      return
+    }
+
+    voiceTranscriptRequestedRef.current = true
+    setVoiceTranscriptLoading(true)
+    setVoiceTranscriptError(false)
+    try {
+      // 检查模型状态
+      const modelStatus = await window.electronAPI.whisper.getModelStatus()
+      if (!modelStatus?.exists) {
+        const error: any = new Error('MODEL_NOT_DOWNLOADED')
+        error.requiresDownload = true
+        error.sessionId = session.username
+        error.messageId = String(message.localId)
+        throw error
+      }
+
+      const result = await window.electronAPI.chat.getVoiceTranscript(session.username, String(message.localId))
+      if (result.success) {
+        const transcriptText = (result.transcript || '').trim()
+        voiceTranscriptCache.set(voiceTranscriptCacheKey, transcriptText)
+        setVoiceTranscript(transcriptText)
+      } else {
+        setVoiceTranscriptError(true)
+        voiceTranscriptRequestedRef.current = false
+      }
+    } catch (error: any) {
+      // 检查是否是模型未下载错误
+      if (error?.requiresDownload) {
+        // 模型未下载，触发下载弹窗
+        onRequireModelDownload?.(error.sessionId, error.messageId)
+        // 不要重置 voiceTranscriptRequestedRef，避免重复触发
+        setVoiceTranscriptLoading(false)
+        return
+      }
+      setVoiceTranscriptError(true)
+      voiceTranscriptRequestedRef.current = false
+    } finally {
+      setVoiceTranscriptLoading(false)
+    }
+  }, [message.localId, session.username, voiceTranscriptCacheKey, voiceTranscriptLoading, onRequireModelDownload])
+
+  // 监听模型下载完成事件
+  useEffect(() => {
+    if (!isVoice) return
+
+    const handleModelDownloaded = (event: CustomEvent) => {
+      if (event.detail?.messageId === String(message.localId)) {
+        // 重置状态，允许重新尝试转写
+        voiceTranscriptRequestedRef.current = false
+        setVoiceTranscriptError(false)
+        // 立即尝试转写
+        void requestVoiceTranscript()
+      }
+    }
+
+    window.addEventListener('model-downloaded', handleModelDownloaded as EventListener)
+    return () => {
+      window.removeEventListener('model-downloaded', handleModelDownloaded as EventListener)
+    }
+  }, [isVoice, message.localId, requestVoiceTranscript])
+
+  // 根据设置决定是否自动转写
+  const [autoTranscribeEnabled, setAutoTranscribeEnabled] = useState(false)
+
+  useEffect(() => {
+    window.electronAPI.config.get('autoTranscribeVoice').then((value) => {
+      setAutoTranscribeEnabled(value === true)
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!autoTranscribeEnabled) return
+    if (!isVoice) return
+    if (!voiceDataUrl) return
+    if (!autoTranscribeVoice) return // 如果自动转文字已关闭，不自动转文字
+    if (voiceTranscriptError) return
+    if (voiceTranscriptLoading || voiceTranscript !== undefined || voiceTranscriptRequestedRef.current) return
+    void requestVoiceTranscript()
+  }, [autoTranscribeEnabled, isVoice, voiceDataUrl, voiceTranscript, voiceTranscriptError, voiceTranscriptLoading, requestVoiceTranscript])
 
   if (isSystem) {
     return (
@@ -1637,56 +1908,54 @@ function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat }:
   // 渲染消息内容
   const renderContent = () => {
     if (isImage) {
-      if (imageLoading) {
-        return (
-          <div className="image-loading">
-            <Loader2 size={20} className="spin" />
-          </div>
-        )
-      }
-      if (imageError || !imageLocalPath) {
-        return (
-          <button
-            className={`image-unavailable ${imageClicked ? 'clicked' : ''}`}
-            onClick={handleImageClick}
-            disabled={imageLoading}
-            type="button"
-          >
-            <ImageIcon size={24} />
-            <span>图片未解密</span>
-            <span className="image-action">{imageClicked ? '已点击…' : '点击解密'}</span>
-          </button>
-        )
-      }
       return (
-        <>
-          <div className="image-message-wrapper">
-            <img
-              src={imageLocalPath}
-              alt="图片"
-              className="image-message"
-              onClick={() => setShowImagePreview(true)}
-              onLoad={() => setImageError(false)}
-              onError={() => setImageError(true)}
-            />
-            {imageHasUpdate && (
-              <button
-                className="image-update-button"
-                type="button"
-                title="发现更高清图片，点击更新"
-                onClick={(event) => {
-                  event.stopPropagation()
-                  void requestImageDecrypt(true)
-                }}
-              >
-                <RefreshCw size={14} />
-              </button>
-            )}
-          </div>
-          {showImagePreview && (
-            <ImagePreview src={imageLocalPath} onClose={() => setShowImagePreview(false)} />
+        <div ref={imageContainerRef}>
+          {imageLoading ? (
+            <div className="image-loading">
+              <Loader2 size={20} className="spin" />
+            </div>
+          ) : imageError || !imageLocalPath ? (
+            <button
+              className={`image-unavailable ${imageClicked ? 'clicked' : ''}`}
+              onClick={handleImageClick}
+              disabled={imageLoading}
+              type="button"
+            >
+              <ImageIcon size={24} />
+              <span>图片未解密</span>
+              <span className="image-action">{imageClicked ? '已点击…' : '点击解密'}</span>
+            </button>
+          ) : (
+            <>
+              <div className="image-message-wrapper">
+                <img
+                  src={imageLocalPath}
+                  alt="图片"
+                  className="image-message"
+                  onClick={() => setShowImagePreview(true)}
+                  onLoad={() => setImageError(false)}
+                  onError={() => setImageError(true)}
+                />
+                {imageHasUpdate && (
+                  <button
+                    className="image-update-button"
+                    type="button"
+                    title="发现更高清图片，点击更新"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      void requestImageDecrypt(true)
+                    }}
+                  >
+                    <RefreshCw size={14} />
+                  </button>
+                )}
+              </div>
+              {showImagePreview && (
+                <ImagePreview src={imageLocalPath} onClose={() => setShowImagePreview(false)} />
+              )}
+            </>
           )}
-        </>
+        </div>
       )
     }
 
@@ -1707,7 +1976,12 @@ function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat }:
           setVoiceLoading(true)
           setVoiceError(false)
           try {
-            const result = await window.electronAPI.chat.getVoiceData(session.username, String(message.localId))
+            const result = await window.electronAPI.chat.getVoiceData(
+              session.username,
+              String(message.localId),
+              message.createTime,
+              message.serverId
+            )
             if (result.success && result.data) {
               const url = `data:audio/wav;base64,${result.data}`
               voiceDataUrlCache.set(voiceCacheKey, url)
@@ -1736,35 +2010,112 @@ function MessageBubble({ message, session, showTime, myAvatarUrl, isGroupChat }:
         }
       }
 
+      const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+        if (!voiceDataUrl || !voiceAudioRef.current) return
+        e.stopPropagation()
+        const rect = e.currentTarget.getBoundingClientRect()
+        const x = e.clientX - rect.left
+        const percentage = x / rect.width
+        const newTime = percentage * voiceDuration
+        voiceAudioRef.current.currentTime = newTime
+        setVoiceCurrentTime(newTime)
+      }
+
       const showDecryptHint = !voiceDataUrl && !voiceLoading && !isVoicePlaying
+      const showTranscript = Boolean(voiceDataUrl) && (voiceTranscriptLoading || voiceTranscriptError || voiceTranscript !== undefined)
+      const transcriptText = (voiceTranscript || '').trim()
+      const transcriptDisplay = voiceTranscriptLoading
+        ? '转写中...'
+        : voiceTranscriptError
+          ? '转写失败，点击重试'
+          : (transcriptText || '未识别到文字')
+      const handleTranscriptRetry = () => {
+        if (!voiceTranscriptError) return
+        voiceTranscriptRequestedRef.current = false
+        void requestVoiceTranscript()
+      }
 
       return (
-        <div className={`voice-message ${isVoicePlaying ? 'playing' : ''}`} onClick={handleToggle}>
-          <button
-            className="voice-play-btn"
-            onClick={(e) => {
-              e.stopPropagation()
-              handleToggle()
-            }}
-            aria-label="播放语音"
-            type="button"
-          >
-            {isVoicePlaying ? <Pause size={16} /> : <Play size={16} />}
-          </button>
-          <div className="voice-wave">
-            <span />
-            <span />
-            <span />
-            <span />
-            <span />
+        <div className="voice-stack">
+          <div className={`voice-message ${isVoicePlaying ? 'playing' : ''}`} onClick={handleToggle}>
+            <button
+              className="voice-play-btn"
+              onClick={(e) => {
+                e.stopPropagation()
+                handleToggle()
+              }}
+              aria-label="播放语音"
+              type="button"
+            >
+              {isVoicePlaying ? <Pause size={16} /> : <Play size={16} />}
+            </button>
+            <div className="voice-wave" onClick={handleSeek}>
+              {voiceDataUrl && voiceWaveform.length > 0 ? (
+                <div className="voice-waveform">
+                  {voiceWaveform.map((amplitude, i) => {
+                    const progress = (voiceCurrentTime / (voiceDuration || 1))
+                    const isPlayed = (i / voiceWaveform.length) < progress
+                    return (
+                      <div
+                        key={i}
+                        className={`waveform-bar ${isPlayed ? 'played' : ''}`}
+                        style={{ height: `${Math.max(20, amplitude * 100)}%` }}
+                      />
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="voice-wave-placeholder">
+                  <span />
+                  <span />
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              )}
+            </div>
+            <div className="voice-info">
+              <span className="voice-label">语音</span>
+              {durationText && <span className="voice-duration">{durationText}</span>}
+              {voiceLoading && <span className="voice-loading">解码中...</span>}
+              {showDecryptHint && <span className="voice-hint">点击解密</span>}
+              {voiceError && <span className="voice-error">播放失败</span>}
+            </div>
+            {/* 转文字按钮 */}
+            {voiceDataUrl && !voiceTranscript && !voiceTranscriptLoading && (
+              <button
+                className="voice-transcribe-btn"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  void requestVoiceTranscript()
+                }}
+                title="转文字"
+                type="button"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                </svg>
+              </button>
+            )}
           </div>
-          <div className="voice-info">
-            <span className="voice-label">语音</span>
-            {durationText && <span className="voice-duration">{durationText}</span>}
-            {voiceLoading && <span className="voice-loading">解码中...</span>}
-            {showDecryptHint && <span className="voice-hint">点击解密</span>}
-            {voiceError && <span className="voice-error">播放失败</span>}
-          </div>
+          {showTranscript && (
+            <div
+              className={`voice-transcript ${isSent ? 'sent' : 'received'}${voiceTranscriptError ? ' error' : ''}`}
+              onClick={handleTranscriptRetry}
+              title={voiceTranscriptError ? '点击重试语音转写' : undefined}
+            >
+              {voiceTranscriptError ? (
+                '转写失败，点击重试'
+              ) : !voiceTranscript ? (
+                voiceTranscriptLoading ? '转写中...' : '未识别到文字'
+              ) : (
+                <AnimatedStreamingText
+                  text={transcriptText}
+                  loading={voiceTranscriptLoading}
+                />
+              )}
+            </div>
+          )}
         </div>
       )
     }

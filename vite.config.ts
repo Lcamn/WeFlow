@@ -30,7 +30,10 @@ export default defineConfig({
               external: [
                 'better-sqlite3',
                 'koffi',
-                'fsevents'
+                'fsevents',
+                'whisper-node',
+                'shelljs',
+                'exceljs'
               ]
             }
           }
@@ -81,6 +84,23 @@ export default defineConfig({
               ],
               output: {
                 entryFileNames: 'wcdbWorker.js',
+                inlineDynamicImports: true
+              }
+            }
+          }
+        }
+      },
+      {
+        entry: 'electron/transcribeWorker.ts',
+        vite: {
+          build: {
+            outDir: 'dist-electron',
+            rollupOptions: {
+              external: [
+                'sherpa-onnx-node'
+              ],
+              output: {
+                entryFileNames: 'transcribeWorker.js',
                 inlineDynamicImports: true
               }
             }

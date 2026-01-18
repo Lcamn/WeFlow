@@ -1,5 +1,5 @@
 import { join, dirname } from 'path'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { app } from 'electron'
 
 export interface SessionMessageCacheEntry {
@@ -15,7 +15,7 @@ export class MessageCacheService {
   constructor(cacheBasePath?: string) {
     const basePath = cacheBasePath && cacheBasePath.trim().length > 0
       ? cacheBasePath
-      : join(app.getPath('userData'), 'WeFlowCache')
+      : join(app.getPath('documents'), 'WeFlow')
     this.cacheFilePath = join(basePath, 'session-messages.json')
     this.ensureCacheDir()
     this.loadCache()
@@ -63,6 +63,15 @@ export class MessageCacheService {
       writeFileSync(this.cacheFilePath, JSON.stringify(this.cache), 'utf8')
     } catch (error) {
       console.error('MessageCacheService: 保存缓存失败', error)
+    }
+  }
+
+  clear(): void {
+    this.cache = {}
+    try {
+      rmSync(this.cacheFilePath, { force: true })
+    } catch (error) {
+      console.error('MessageCacheService: 清理缓存失败', error)
     }
   }
 }

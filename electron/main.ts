@@ -15,6 +15,7 @@ import { groupAnalyticsService } from './services/groupAnalyticsService'
 import { annualReportService } from './services/annualReportService'
 import { exportService, ExportOptions } from './services/exportService'
 import { KeyService } from './services/keyService'
+import { voiceTranscribeService } from './services/voiceTranscribeService'
 
 
 // 配置自动更新
@@ -438,8 +439,17 @@ function registerIpcHandlers() {
     return chatService.getImageData(sessionId, msgId)
   })
 
-  ipcMain.handle('chat:getVoiceData', async (_, sessionId: string, msgId: string) => {
-    return chatService.getVoiceData(sessionId, msgId)
+  ipcMain.handle('chat:getVoiceData', async (_, sessionId: string, msgId: string, createTime?: number, serverId?: string | number) => {
+    return chatService.getVoiceData(sessionId, msgId, createTime, serverId)
+  })
+  ipcMain.handle('chat:resolveVoiceCache', async (_, sessionId: string, msgId: string) => {
+    return chatService.resolveVoiceCache(sessionId, msgId)
+  })
+
+  ipcMain.handle('chat:getVoiceTranscript', async (event, sessionId: string, msgId: string) => {
+    return chatService.getVoiceTranscript(sessionId, msgId, (text) => {
+      event.sender.send('chat:voiceTranscriptPartial', { msgId, text })
+    })
   })
 
   ipcMain.handle('chat:getMessageById', async (_, sessionId: string, localId: number) => {
@@ -480,6 +490,50 @@ function registerIpcHandlers() {
 
   ipcMain.handle('analytics:getTimeDistribution', async () => {
     return analyticsService.getTimeDistribution()
+  })
+
+  // 缓存管理
+  ipcMain.handle('cache:clearAnalytics', async () => {
+    return analyticsService.clearCache()
+  })
+
+  ipcMain.handle('cache:clearImages', async () => {
+    const imageResult = await imageDecryptService.clearCache()
+    const emojiResult = chatService.clearCaches({ includeMessages: false, includeContacts: false, includeEmojis: true })
+    const errors = [imageResult, emojiResult]
+      .filter((result) => !result.success)
+      .map((result) => result.error)
+      .filter(Boolean) as string[]
+    if (errors.length > 0) {
+      return { success: false, error: errors.join('; ') }
+    }
+    return { success: true }
+  })
+
+  ipcMain.handle('cache:clearAll', async () => {
+    const [analyticsResult, imageResult] = await Promise.all([
+      analyticsService.clearCache(),
+      imageDecryptService.clearCache()
+    ])
+    const chatResult = chatService.clearCaches()
+    const errors = [analyticsResult, imageResult, chatResult]
+      .filter((result) => !result.success)
+      .map((result) => result.error)
+      .filter(Boolean) as string[]
+    if (errors.length > 0) {
+      return { success: false, error: errors.join('; ') }
+    }
+    return { success: true }
+  })
+
+  ipcMain.handle('whisper:downloadModel', async (event) => {
+    return voiceTranscribeService.downloadModel((progress) => {
+      event.sender.send('whisper:downloadProgress', progress)
+    })
+  })
+
+  ipcMain.handle('whisper:getModelStatus', async () => {
+    return voiceTranscribeService.getModelStatus()
   })
 
   // 群聊分析相关

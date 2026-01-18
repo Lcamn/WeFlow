@@ -94,7 +94,10 @@ export interface ElectronAPI {
       error?: string
     }>
     getImageData: (sessionId: string, msgId: string) => Promise<{ success: boolean; data?: string; error?: string }>
-    getVoiceData: (sessionId: string, msgId: string) => Promise<{ success: boolean; data?: string; error?: string }>
+    getVoiceData: (sessionId: string, msgId: string, createTime?: number, serverId?: string | number) => Promise<{ success: boolean; data?: string; error?: string }>
+    resolveVoiceCache: (sessionId: string, msgId: string) => Promise<{ success: boolean; hasCache: boolean; data?: string }>
+    getVoiceTranscript: (sessionId: string, msgId: string) => Promise<{ success: boolean; transcript?: string; error?: string }>
+    onVoiceTranscriptPartial: (callback: (payload: { msgId: string; text: string }) => void) => () => void
   }
 
   image: {
@@ -147,6 +150,11 @@ export interface ElectronAPI {
       error?: string
     }>
     onProgress: (callback: (payload: { status: string; progress: number }) => void) => () => void
+  }
+  cache: {
+    clearAnalytics: () => Promise<{ success: boolean; error?: string }>
+    clearImages: () => Promise<{ success: boolean; error?: string }>
+    clearAll: () => Promise<{ success: boolean; error?: string }>
   }
   groupAnalytics: {
     getGroupChats: () => Promise<{
@@ -289,6 +297,11 @@ export interface ElectronAPI {
       success: boolean
       error?: string
     }>
+  }
+  whisper: {
+    downloadModel: () => Promise<{ success: boolean; modelPath?: string; tokensPath?: string; error?: string }>
+    getModelStatus: () => Promise<{ success: boolean; exists?: boolean; modelPath?: string; tokensPath?: string; sizeBytes?: number; error?: string }>
+    onDownloadProgress: (callback: (payload: { modelName: string; downloadedBytes: number; totalBytes?: number; percent?: number }) => void) => () => void
   }
 }
 

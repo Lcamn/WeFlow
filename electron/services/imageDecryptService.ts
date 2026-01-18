@@ -2,11 +2,43 @@ import { app, BrowserWindow } from 'electron'
 import { basename, dirname, extname, join } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, appendFileSync } from 'fs'
-import { writeFile } from 'fs/promises'
+import { writeFile, rm, readdir } from 'fs/promises'
 import crypto from 'crypto'
 import { Worker } from 'worker_threads'
 import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
+
+// 获取 ffmpeg-static 的路径
+function getStaticFfmpegPath(): string | null {
+  try {
+    // 方法1: 直接 require ffmpeg-static
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const ffmpegStatic = require('ffmpeg-static')
+
+    if (typeof ffmpegStatic === 'string' && existsSync(ffmpegStatic)) {
+      return ffmpegStatic
+    }
+
+    // 方法2: 手动构建路径（开发环境）
+    const devPath = join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg.exe')
+    if (existsSync(devPath)) {
+      return devPath
+    }
+
+    // 方法3: 打包后的路径
+    if (app.isPackaged) {
+      const resourcesPath = process.resourcesPath
+      const packedPath = join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe')
+      if (existsSync(packedPath)) {
+        return packedPath
+      }
+    }
+
+    return null
+  } catch {
+    return null
+  }
+}
 
 type DecryptResult = {
   success: boolean
@@ -83,7 +115,6 @@ export class ImageDecryptService {
     for (const key of cacheKeys) {
       const cached = this.resolvedCache.get(key)
       if (cached && existsSync(cached) && this.isImageFile(cached)) {
-        this.logInfo('缓存命中(从Map)', { key, path: cached, isThumb: this.isThumbnailPath(cached) })
         const dataUrl = this.fileToDataUrl(cached)
         const isThumb = this.isThumbnailPath(cached)
         const hasUpdate = isThumb ? (this.updateFlags.get(key) ?? false) : false
@@ -103,7 +134,6 @@ export class ImageDecryptService {
     for (const key of cacheKeys) {
       const existing = this.findCachedOutput(key, false, payload.sessionId)
       if (existing) {
-        this.logInfo('缓存命中(文件系统)', { key, path: existing, isThumb: this.isThumbnailPath(existing) })
         this.cacheResolvedPaths(key, payload.imageMd5, payload.imageDatName, existing)
         const dataUrl = this.fileToDataUrl(existing)
         const isThumb = this.isThumbnailPath(existing)
@@ -238,20 +268,39 @@ export class ImageDecryptService {
       const aesKey = this.resolveAesKey(aesKeyRaw)
 
       this.logInfo('开始解密DAT文件', { datPath, xorKey, hasAesKey: !!aesKey })
-      const decrypted = await this.decryptDatAuto(datPath, xorKey, aesKey)
+      let decrypted = await this.decryptDatAuto(datPath, xorKey, aesKey)
 
-      const ext = this.detectImageExtension(decrypted) || '.jpg'
+      // 检查是否是 wxgf 格式，如果是则尝试提取真实图片数据
+      const wxgfResult = await this.unwrapWxgf(decrypted)
+      decrypted = wxgfResult.data
 
-      const outputPath = this.getCacheOutputPathFromDat(datPath, ext, payload.sessionId)
+      let ext = this.detectImageExtension(decrypted)
+
+      // 如果是 wxgf 格式且没检测到扩展名
+      if (wxgfResult.isWxgf && !ext) {
+        ext = '.hevc'
+      }
+
+      const finalExt = ext || '.jpg'
+
+      const outputPath = this.getCacheOutputPathFromDat(datPath, finalExt, payload.sessionId)
       await writeFile(outputPath, decrypted)
       this.logInfo('解密成功', { outputPath, size: decrypted.length })
 
+      // 对于 hevc 格式，返回错误提示
+      if (finalExt === '.hevc') {
+        return {
+          success: false,
+          error: '此图片为微信新格式(wxgf)，需要安装 ffmpeg 才能显示',
+          isThumb: this.isThumbnailPath(datPath)
+        }
+      }
       const isThumb = this.isThumbnailPath(datPath)
       this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, outputPath)
       if (!isThumb) {
         this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
       }
-      const dataUrl = this.bufferToDataUrl(decrypted, ext)
+      const dataUrl = this.bufferToDataUrl(decrypted, finalExt)
       const localPath = dataUrl || this.filePathToUrl(outputPath)
       this.emitCacheResolved(payload, cacheKey, localPath)
       return { success: true, localPath, isThumb }
@@ -904,6 +953,18 @@ export class ImageDecryptService {
     extensions: string[],
     preferHd: boolean
   ): string | null {
+    // 先检查并删除旧的 .hevc 文件（ffmpeg 转换失败时遗留的）
+    const hevcThumb = join(dirPath, `${normalizedKey}_thumb.hevc`)
+    const hevcHd = join(dirPath, `${normalizedKey}_hd.hevc`)
+    try {
+      if (existsSync(hevcThumb)) {
+        require('fs').unlinkSync(hevcThumb)
+      }
+      if (existsSync(hevcHd)) {
+        require('fs').unlinkSync(hevcHd)
+      }
+    } catch { }
+
     for (const ext of extensions) {
       if (preferHd) {
         const hdPath = join(dirPath, `${normalizedKey}_hd${ext}`)
@@ -1406,6 +1467,159 @@ export class ImageDecryptService {
     return mostCommonKey
   }
 
+  /**
+   * 解包 wxgf 格式
+   * wxgf 是微信的图片格式，内部使用 HEVC 编码
+   */
+  private async unwrapWxgf(buffer: Buffer): Promise<{ data: Buffer; isWxgf: boolean }> {
+    // 检查是否是 wxgf 格式 (77 78 67 66 = "wxgf")
+    if (buffer.length < 20 ||
+      buffer[0] !== 0x77 || buffer[1] !== 0x78 ||
+      buffer[2] !== 0x67 || buffer[3] !== 0x66) {
+      return { data: buffer, isWxgf: false }
+    }
+
+    // 先尝试搜索内嵌的传统图片签名
+    for (let i = 4; i < Math.min(buffer.length - 12, 4096); i++) {
+      if (buffer[i] === 0xff && buffer[i + 1] === 0xd8 && buffer[i + 2] === 0xff) {
+        return { data: buffer.subarray(i), isWxgf: false }
+      }
+      if (buffer[i] === 0x89 && buffer[i + 1] === 0x50 &&
+        buffer[i + 2] === 0x4e && buffer[i + 3] === 0x47) {
+        return { data: buffer.subarray(i), isWxgf: false }
+      }
+    }
+
+    // 提取 HEVC NALU 裸流
+    const hevcData = this.extractHevcNalu(buffer)
+    if (!hevcData || hevcData.length < 100) {
+      return { data: buffer, isWxgf: true }
+    }
+
+    // 尝试用 ffmpeg 转换
+    try {
+      const jpgData = await this.convertHevcToJpg(hevcData)
+      if (jpgData && jpgData.length > 0) {
+        return { data: jpgData, isWxgf: false }
+      }
+    } catch {
+      // ffmpeg 转换失败
+    }
+
+    return { data: hevcData, isWxgf: true }
+  }
+
+  /**
+   * 从 wxgf 数据中提取 HEVC NALU 裸流
+   */
+  private extractHevcNalu(buffer: Buffer): Buffer | null {
+    const nalUnits: Buffer[] = []
+    let i = 4
+
+    while (i < buffer.length - 4) {
+      if (buffer[i] === 0x00 && buffer[i + 1] === 0x00 &&
+        buffer[i + 2] === 0x00 && buffer[i + 3] === 0x01) {
+        let nalStart = i
+        let nalEnd = buffer.length
+
+        for (let j = i + 4; j < buffer.length - 3; j++) {
+          if (buffer[j] === 0x00 && buffer[j + 1] === 0x00) {
+            if (buffer[j + 2] === 0x01 ||
+              (buffer[j + 2] === 0x00 && j + 3 < buffer.length && buffer[j + 3] === 0x01)) {
+              nalEnd = j
+              break
+            }
+          }
+        }
+
+        const nalUnit = buffer.subarray(nalStart, nalEnd)
+        if (nalUnit.length > 3) {
+          nalUnits.push(nalUnit)
+        }
+        i = nalEnd
+      } else {
+        i++
+      }
+    }
+
+    if (nalUnits.length === 0) {
+      for (let j = 4; j < buffer.length - 4; j++) {
+        if (buffer[j] === 0x00 && buffer[j + 1] === 0x00 &&
+          buffer[j + 2] === 0x00 && buffer[j + 3] === 0x01) {
+          return buffer.subarray(j)
+        }
+      }
+      return null
+    }
+
+    return Buffer.concat(nalUnits)
+  }
+
+  /**
+   * 获取 ffmpeg 可执行文件路径
+   */
+  private getFfmpegPath(): string {
+    const staticPath = getStaticFfmpegPath()
+    this.logInfo('ffmpeg 路径检测', { staticPath, exists: staticPath ? existsSync(staticPath) : false })
+
+    if (staticPath) {
+      return staticPath
+    }
+
+    // 回退到系统 ffmpeg
+    return 'ffmpeg'
+  }
+
+  /**
+   * 使用 ffmpeg 将 HEVC 裸流转换为 JPG
+   */
+  private convertHevcToJpg(hevcData: Buffer): Promise<Buffer | null> {
+    const ffmpeg = this.getFfmpegPath()
+    this.logInfo('ffmpeg 转换开始', { ffmpegPath: ffmpeg, hevcSize: hevcData.length })
+
+    return new Promise((resolve) => {
+      const { spawn } = require('child_process')
+      const chunks: Buffer[] = []
+      const errChunks: Buffer[] = []
+
+      const proc = spawn(ffmpeg, [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-f', 'hevc',
+        '-i', 'pipe:0',
+        '-vframes', '1',
+        '-q:v', '3',
+        '-f', 'mjpeg',
+        'pipe:1'
+      ], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true
+      })
+
+      proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk))
+      proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk))
+
+      proc.on('close', (code: number) => {
+        if (code === 0 && chunks.length > 0) {
+          this.logInfo('ffmpeg 转换成功', { outputSize: Buffer.concat(chunks).length })
+          resolve(Buffer.concat(chunks))
+        } else {
+          const errMsg = Buffer.concat(errChunks).toString()
+          this.logInfo('ffmpeg 转换失败', { code, error: errMsg })
+          resolve(null)
+        }
+      })
+
+      proc.on('error', (err: Error) => {
+        this.logInfo('ffmpeg 进程错误', { error: err.message })
+        resolve(null)
+      })
+
+      proc.stdin.write(hevcData)
+      proc.stdin.end()
+    })
+  }
+
   // 保留原有的解密到文件方法（用于兼容）
   async decryptToFile(inputPath: string, outputPath: string, xorKey: number, aesKey?: Buffer): Promise<void> {
     const version = this.getDatVersion(inputPath)
@@ -1429,6 +1643,71 @@ export class ImageDecryptService {
     }
 
     await writeFile(outputPath, decrypted)
+  }
+
+  async clearCache(): Promise<{ success: boolean; error?: string }> {
+    this.resolvedCache.clear()
+    this.hardlinkCache.clear()
+    this.pending.clear()
+    this.updateFlags.clear()
+    this.cacheIndexed = false
+    this.cacheIndexing = null
+
+    const configured = this.configService.get('cachePath')
+    const root = configured
+      ? join(configured, 'Images')
+      : join(app.getPath('documents'), 'WeFlow', 'Images')
+
+    try {
+      if (!existsSync(root)) {
+        return { success: true }
+      }
+      const monthPattern = /^\d{4}-\d{2}$/
+      const clearFilesInDir = async (dirPath: string): Promise<void> => {
+        let entries: Array<{ name: string; isDirectory: () => boolean }>
+        try {
+          entries = await readdir(dirPath, { withFileTypes: true })
+        } catch {
+          return
+        }
+        for (const entry of entries) {
+          const fullPath = join(dirPath, entry.name)
+          if (entry.isDirectory()) {
+            await clearFilesInDir(fullPath)
+            continue
+          }
+          try {
+            await rm(fullPath, { force: true })
+          } catch { }
+        }
+      }
+      const traverse = async (dirPath: string): Promise<void> => {
+        let entries: Array<{ name: string; isDirectory: () => boolean }>
+        try {
+          entries = await readdir(dirPath, { withFileTypes: true })
+        } catch {
+          return
+        }
+        for (const entry of entries) {
+          const fullPath = join(dirPath, entry.name)
+          if (entry.isDirectory()) {
+            if (monthPattern.test(entry.name)) {
+              await clearFilesInDir(fullPath)
+            } else {
+              await traverse(fullPath)
+            }
+            continue
+          }
+          try {
+            await rm(fullPath, { force: true })
+          } catch { }
+        }
+      }
+      await traverse(root)
+      return { success: true }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
   }
 }
 

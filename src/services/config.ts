@@ -17,7 +17,12 @@ export const CONFIG_KEYS = {
   ONBOARDING_DONE: 'onboardingDone',
   LLM_MODEL_PATH: 'llmModelPath',
   IMAGE_XOR_KEY: 'imageXorKey',
-  IMAGE_AES_KEY: 'imageAesKey'
+  IMAGE_AES_KEY: 'imageAesKey',
+  WHISPER_MODEL_NAME: 'whisperModelName',
+  WHISPER_MODEL_DIR: 'whisperModelDir',
+  WHISPER_DOWNLOAD_SOURCE: 'whisperDownloadSource',
+  AUTO_TRANSCRIBE_VOICE: 'autoTranscribeVoice',
+  TRANSCRIBE_LANGUAGES: 'transcribeLanguages'
 } as const
 
 // 获取解密密钥
@@ -144,6 +149,39 @@ export async function setLlmModelPath(path: string): Promise<void> {
   await config.set(CONFIG_KEYS.LLM_MODEL_PATH, path)
 }
 
+// 获取 Whisper 模型名称
+export async function getWhisperModelName(): Promise<string | null> {
+  const value = await config.get(CONFIG_KEYS.WHISPER_MODEL_NAME)
+  return (value as string) || null
+}
+
+// 设置 Whisper 模型名称
+export async function setWhisperModelName(name: string): Promise<void> {
+  await config.set(CONFIG_KEYS.WHISPER_MODEL_NAME, name)
+}
+
+// 获取 Whisper 模型目录
+export async function getWhisperModelDir(): Promise<string | null> {
+  const value = await config.get(CONFIG_KEYS.WHISPER_MODEL_DIR)
+  return (value as string) || null
+}
+
+// 设置 Whisper 模型目录
+export async function setWhisperModelDir(dir: string): Promise<void> {
+  await config.set(CONFIG_KEYS.WHISPER_MODEL_DIR, dir)
+}
+
+// 获取 Whisper 下载源
+export async function getWhisperDownloadSource(): Promise<string | null> {
+  const value = await config.get(CONFIG_KEYS.WHISPER_DOWNLOAD_SOURCE)
+  return (value as string) || null
+}
+
+// 设置 Whisper 下载源
+export async function setWhisperDownloadSource(source: string): Promise<void> {
+  await config.set(CONFIG_KEYS.WHISPER_DOWNLOAD_SOURCE, source)
+}
+
 // 清除所有配置
 export async function clearConfig(): Promise<void> {
   await config.clear()
@@ -181,4 +219,27 @@ export async function getOnboardingDone(): Promise<boolean> {
 // 设置首次配置引导完成
 export async function setOnboardingDone(done: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.ONBOARDING_DONE, done)
+}
+
+// 获取自动语音转文字开关
+export async function getAutoTranscribeVoice(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AUTO_TRANSCRIBE_VOICE)
+  return value === true
+}
+
+// 设置自动语音转文字开关
+export async function setAutoTranscribeVoice(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AUTO_TRANSCRIBE_VOICE, enabled)
+}
+
+// 获取语音转文字支持的语言列表
+export async function getTranscribeLanguages(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.TRANSCRIBE_LANGUAGES)
+  // 默认只支持中文
+  return (value as string[]) || ['zh']
+}
+
+// 设置语音转文字支持的语言列表
+export async function setTranscribeLanguages(languages: string[]): Promise<void> {
+  await config.set(CONFIG_KEYS.TRANSCRIBE_LANGUAGES, languages)
 }

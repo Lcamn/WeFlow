@@ -20,6 +20,11 @@ interface ConfigSchema {
   language: string
   logEnabled: boolean
   llmModelPath: string
+  whisperModelName: string
+  whisperModelDir: string
+  whisperDownloadSource: string
+  autoTranscribeVoice: boolean
+  transcribeLanguages: string[]
 }
 
 export class ConfigService {
@@ -42,7 +47,12 @@ export class ConfigService {
         themeId: 'cloud-dancer',
         language: 'zh-CN',
         logEnabled: false,
-        llmModelPath: ''
+        llmModelPath: '',
+        whisperModelName: 'base',
+        whisperModelDir: '',
+        whisperDownloadSource: 'tsinghua',
+        autoTranscribeVoice: false,
+        transcribeLanguages: ['zh']
       }
     })
   }

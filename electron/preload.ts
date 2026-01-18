@@ -106,7 +106,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     close: () => ipcRenderer.invoke('chat:close'),
     getSessionDetail: (sessionId: string) => ipcRenderer.invoke('chat:getSessionDetail', sessionId),
     getImageData: (sessionId: string, msgId: string) => ipcRenderer.invoke('chat:getImageData', sessionId, msgId),
-    getVoiceData: (sessionId: string, msgId: string) => ipcRenderer.invoke('chat:getVoiceData', sessionId, msgId)
+    getVoiceData: (sessionId: string, msgId: string, createTime?: number, serverId?: string | number) =>
+      ipcRenderer.invoke('chat:getVoiceData', sessionId, msgId, createTime, serverId),
+    resolveVoiceCache: (sessionId: string, msgId: string) => ipcRenderer.invoke('chat:resolveVoiceCache', sessionId, msgId),
+    getVoiceTranscript: (sessionId: string, msgId: string) => ipcRenderer.invoke('chat:getVoiceTranscript', sessionId, msgId),
+    onVoiceTranscriptPartial: (callback: (payload: { msgId: string; text: string }) => void) => {
+      const listener = (_: any, payload: { msgId: string; text: string }) => callback(payload)
+      ipcRenderer.on('chat:voiceTranscriptPartial', listener)
+      return () => ipcRenderer.removeListener('chat:voiceTranscriptPartial', listener)
+    }
   },
 
 
@@ -140,6 +148,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
 
+  // 缓存管理
+  cache: {
+    clearAnalytics: () => ipcRenderer.invoke('cache:clearAnalytics'),
+    clearImages: () => ipcRenderer.invoke('cache:clearImages'),
+    clearAll: () => ipcRenderer.invoke('cache:clearAll')
+  },
+
   // 群聊分析
   groupAnalytics: {
     getGroupChats: () => ipcRenderer.invoke('groupAnalytics:getGroupChats'),
@@ -167,5 +182,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('export:exportSessions', sessionIds, outputDir, options),
     exportSession: (sessionId: string, outputPath: string, options: any) =>
       ipcRenderer.invoke('export:exportSession', sessionId, outputPath, options)
+  },
+
+  whisper: {
+    downloadModel: () =>
+      ipcRenderer.invoke('whisper:downloadModel'),
+    getModelStatus: () =>
+      ipcRenderer.invoke('whisper:getModelStatus'),
+    onDownloadProgress: (callback: (payload: { modelName: string; downloadedBytes: number; totalBytes?: number; percent?: number }) => void) => {
+      ipcRenderer.on('whisper:downloadProgress', (_, payload) => callback(payload))
+      return () => ipcRenderer.removeAllListeners('whisper:downloadProgress')
+    }
   }
 })

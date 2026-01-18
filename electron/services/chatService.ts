@@ -7,15 +7,12 @@ import * as http from 'http'
 import * as fzstd from 'fzstd'
 import * as crypto from 'crypto'
 import Database from 'better-sqlite3'
-import { execFile } from 'child_process'
-import { promisify } from 'util'
 import { app } from 'electron'
-
-const execFileAsync = promisify(execFile)
 import { ConfigService } from './config'
 import { wcdbService } from './wcdbService'
 import { MessageCacheService } from './messageCacheService'
 import { ContactCacheService, ContactCacheEntry } from './contactCacheService'
+import { voiceTranscribeService } from './voiceTranscribeService'
 
 type HardlinkState = {
   db: Database.Database
@@ -83,6 +80,10 @@ class ChatService {
   private hardlinkCache = new Map<string, HardlinkState>()
   private readonly contactCacheService: ContactCacheService
   private readonly messageCacheService: MessageCacheService
+  private voiceWavCache = new Map<string, Buffer>()
+  private voiceTranscriptCache = new Map<string, string>()
+  private voiceTranscriptPending = new Map<string, Promise<{ success: boolean; transcript?: string; error?: string }>>()
+  private readonly voiceCacheMaxEntries = 50
 
   constructor() {
     this.configService = new ConfigService()
@@ -1725,6 +1726,48 @@ class ChatService {
     return join(documentsPath, 'WeFlow', 'Emojis')
   }
 
+  clearCaches(options?: { includeMessages?: boolean; includeContacts?: boolean; includeEmojis?: boolean }): { success: boolean; error?: string } {
+    const includeMessages = options?.includeMessages !== false
+    const includeContacts = options?.includeContacts !== false
+    const includeEmojis = options?.includeEmojis !== false
+    const errors: string[] = []
+
+    if (includeContacts) {
+      this.avatarCache.clear()
+      this.contactCacheService.clear()
+    }
+
+    if (includeMessages) {
+      this.messageCacheService.clear()
+      this.voiceWavCache.clear()
+      this.voiceTranscriptCache.clear()
+      this.voiceTranscriptPending.clear()
+    }
+
+    for (const state of this.hardlinkCache.values()) {
+      try {
+        state.db?.close()
+      } catch { }
+    }
+    this.hardlinkCache.clear()
+
+    if (includeEmojis) {
+      emojiCache.clear()
+      emojiDownloading.clear()
+      const emojiDir = this.getEmojiCacheDir()
+      try {
+        fs.rmSync(emojiDir, { recursive: true, force: true })
+      } catch (error) {
+        errors.push(String(error))
+      }
+    }
+
+    if (errors.length > 0) {
+      return { success: false, error: errors.join('; ') }
+    }
+    return { success: true }
+  }
+
   /**
    * 下载并缓存表情包
    */
@@ -2102,14 +2145,141 @@ class ChatService {
     }
   }
 
-  async getVoiceData(sessionId: string, msgId: string): Promise<{ success: boolean; data?: string; error?: string }> {
+  /**
+   * getVoiceData (优化的 C++ 实现 + 文件缓存)
+   */
+  async getVoiceData(sessionId: string, msgId: string, createTime?: number, serverId?: string | number): Promise<{ success: boolean; data?: string; error?: string }> {
+
+    try {
+      const localId = parseInt(msgId, 10)
+      if (isNaN(localId)) {
+        return { success: false, error: '无效的消息ID' }
+      }
+
+      // 检查文件缓存
+      const cacheKey = this.getVoiceCacheKey(sessionId, msgId)
+      const cachedFile = this.getVoiceCacheFilePath(cacheKey)
+      if (existsSync(cachedFile)) {
+        try {
+          const wavData = readFileSync(cachedFile)
+          console.info('[ChatService][Voice] 使用缓存文件:', cachedFile)
+          return { success: true, data: wavData.toString('base64') }
+        } catch (e) {
+          console.error('[ChatService][Voice] 读取缓存失败:', e)
+          // 继续重新解密
+        }
+      }
+
+      // 1. 确定 createTime 和 svrId
+      let msgCreateTime = createTime
+      let msgSvrId: string | number = serverId || 0
+
+      // 如果提供了传来的参数，验证其有效性
+      if (!msgCreateTime || msgCreateTime === 0) {
+        const msgResult = await this.getMessageByLocalId(sessionId, localId)
+        if (msgResult.success && msgResult.message) {
+          const msg = msgResult.message as any
+          msgCreateTime = msg.createTime || msg.create_time
+          // 尝试获取各种可能的 server id 列名 (只有在没有传入 serverId 时才查找)
+          if (!msgSvrId || msgSvrId === 0) {
+            msgSvrId = msg.serverId || msg.svr_id || msg.msg_svr_id || msg.message_id || 0
+          }
+        }
+      }
+
+      if (!msgCreateTime) {
+        return { success: false, error: '未找到消息时间戳' }
+      }
+
+      // 2. 构建查找候选 (sessionId, myWxid)
+      const candidates: string[] = []
+      if (sessionId) candidates.push(sessionId)
+      const myWxid = this.configService.get('myWxid') as string
+      if (myWxid && !candidates.includes(myWxid)) {
+        candidates.push(myWxid)
+      }
+
+
+
+      // 3. 调用 C++ 接口获取语音 (Hex)
+      const voiceRes = await wcdbService.getVoiceData(sessionId, msgCreateTime, candidates, localId, msgSvrId)
+      if (!voiceRes.success || !voiceRes.hex) {
+        return { success: false, error: voiceRes.error || '未找到语音数据' }
+      }
+
+
+
+      // 4. Hex 转 Buffer (Silk)
+      const silkData = Buffer.from(voiceRes.hex, 'hex')
+
+      // 5. 使用 silk-wasm 解码
+      try {
+        const pcmData = await this.decodeSilkToPcm(silkData, 24000)
+        if (!pcmData) {
+          return { success: false, error: 'Silk 解码失败' }
+        }
+
+        // PCM -> WAV
+        const wavData = this.createWavBuffer(pcmData, 24000)
+
+        // 保存到文件缓存
+        try {
+          this.saveVoiceCache(cacheKey, wavData)
+          console.info('[ChatService][Voice] 已保存缓存:', cachedFile)
+        } catch (e) {
+          console.error('[ChatService][Voice] 保存缓存失败:', e)
+          // 不影响返回
+        }
+
+        // 缓存 WAV 数据 (内存缓存)
+        this.cacheVoiceWav(cacheKey, wavData)
+
+        return { success: true, data: wavData.toString('base64') }
+      } catch (e) {
+        console.error('[ChatService][Voice] decoding error:', e)
+        return { success: false, error: '语音解码失败: ' + String(e) }
+      }
+    } catch (e) {
+      console.error('ChatService: getVoiceData 失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /**
+   * 检查语音是否已有缓存
+   */
+  async resolveVoiceCache(sessionId: string, msgId: string): Promise<{ success: boolean; hasCache: boolean; data?: string }> {
+    try {
+      const cacheKey = this.getVoiceCacheKey(sessionId, msgId)
+
+      // 1. 检查内存缓存
+      const inMemory = this.voiceWavCache.get(cacheKey)
+      if (inMemory) {
+        return { success: true, hasCache: true, data: inMemory.toString('base64') }
+      }
+
+      // 2. 检查文件缓存
+      const cachedFile = this.getVoiceCacheFilePath(cacheKey)
+      if (existsSync(cachedFile)) {
+        const wavData = readFileSync(cachedFile)
+        this.cacheVoiceWav(cacheKey, wavData) // 回甜内存
+        return { success: true, hasCache: true, data: wavData.toString('base64') }
+      }
+
+      return { success: true, hasCache: false }
+    } catch (e) {
+      return { success: false, hasCache: false }
+    }
+  }
+
+  async getVoiceData_Legacy(sessionId: string, msgId: string): Promise<{ success: boolean; data?: string; error?: string }> {
     try {
       const localId = parseInt(msgId, 10)
       const msgResult = await this.getMessageByLocalId(sessionId, localId)
       if (!msgResult.success || !msgResult.message) return { success: false, error: '未找到该消息' }
       const msg = msgResult.message
       if (msg.isSend === 1) {
-        return { success: false, error: '暂不支持解密自己发送的语音' }
+        console.info('[ChatService][Voice] self-sent voice, continue decrypt flow')
       }
 
       const candidates = this.getVoiceLookupCandidates(sessionId, msg)
@@ -2140,12 +2310,10 @@ class ChatService {
       for (const dbPath of (mediaDbs.data || [])) {
         const voiceTable = await this.resolveVoiceInfoTableName(dbPath)
         if (!voiceTable) {
-          console.warn('[ChatService][Voice] voice table not found', dbPath)
           continue
         }
         const columns = await this.resolveVoiceInfoColumns(dbPath, voiceTable)
         if (!columns) {
-          console.warn('[ChatService][Voice] voice columns not found', { dbPath, voiceTable })
           continue
         }
         for (const candidate of candidates) {
@@ -2186,50 +2354,44 @@ class ChatService {
           }
         }
         if (silkData) break
+
+        // 策略 3: 只使用 CreateTime (兜底)
+        if (!silkData && columns.createTimeColumn) {
+          const whereClause = `${columns.createTimeColumn} = ${msg.createTime}`
+          const sql = `SELECT ${columns.dataColumn} AS data FROM ${voiceTable} WHERE ${whereClause} LIMIT 1`
+          const result = await wcdbService.execQuery('media', dbPath, sql)
+          if (result.success && result.rows && result.rows.length > 0) {
+            const raw = result.rows[0]?.data
+            const decoded = this.decodeVoiceBlob(raw)
+            if (decoded && decoded.length > 0) {
+              console.info('[ChatService][Voice] hit by createTime only', { dbPath, voiceTable, whereClause, bytes: decoded.length })
+              silkData = decoded
+            }
+          }
+        }
+        if (silkData) break
       }
 
       if (!silkData) return { success: false, error: '未找到语音数据' }
 
-      // 4. 解码 Silk -> PCM -> WAV
-      const resourcesPath = app.isPackaged
-        ? join(process.resourcesPath, 'resources')
-        : join(app.getAppPath(), 'resources')
-      const decoderPath = join(resourcesPath, 'silk_v3_decoder.exe')
-
-      if (!existsSync(decoderPath)) {
-        return { success: false, error: '找不到语音解码器 (silk_v3_decoder.exe)' }
-      }
-      console.info('[ChatService][Voice] decoder path', decoderPath)
-
-      const tempDir = app.getPath('temp')
-      const silkFile = join(tempDir, `voice_${msgId}.silk`)
-      const pcmFile = join(tempDir, `voice_${msgId}.pcm`)
-
+      // 4. 使用 silk-wasm 解码
       try {
-        writeFileSync(silkFile, silkData)
-        // 执行解码: silk_v3_decoder.exe <silk> <pcm> -Fs_API 24000
-        console.info('[ChatService][Voice] executing decoder:', decoderPath, [silkFile, pcmFile])
-        const { stdout, stderr } = await execFileAsync(
-          decoderPath,
-          [silkFile, pcmFile, '-Fs_API', '24000'],
-          { cwd: dirname(decoderPath) }
-        )
-        if (stdout && stdout.trim()) console.info('[ChatService][Voice] decoder stdout:', stdout)
-        if (stderr && stderr.trim()) console.warn('[ChatService][Voice] decoder stderr:', stderr)
-
-        if (!existsSync(pcmFile)) {
-          return { success: false, error: '语音解码失败' }
+        const pcmData = await this.decodeSilkToPcm(silkData, 24000)
+        if (!pcmData) {
+          return { success: false, error: 'Silk 解码失败' }
         }
 
-        const pcmData = readFileSync(pcmFile)
-        const wavHeader = this.createWavHeader(pcmData.length, 24000, 1) // 微信语音通常 24kHz
-        const wavData = Buffer.concat([wavHeader, pcmData])
+        // PCM -> WAV
+        const wavData = this.createWavBuffer(pcmData, 24000)
+
+        // 缓存 WAV 数据 (内存缓存)
+        const cacheKey = this.getVoiceCacheKey(sessionId, msgId)
+        this.cacheVoiceWav(cacheKey, wavData)
 
         return { success: true, data: wavData.toString('base64') }
-      } finally {
-        // 清理临时文件
-        try { if (existsSync(silkFile)) unlinkSync(silkFile) } catch { }
-        try { if (existsSync(pcmFile)) unlinkSync(pcmFile) } catch { }
+      } catch (e) {
+        console.error('[ChatService][Voice] decoding error:', e)
+        return { success: false, error: '语音解码失败: ' + String(e) }
       }
     } catch (e) {
       console.error('ChatService: getVoiceData 失败:', e)
@@ -2237,7 +2399,47 @@ class ChatService {
     }
   }
 
-  private createWavHeader(pcmLength: number, sampleRate: number = 24000, channels: number = 1): Buffer {
+
+
+  /**
+   * 解码 Silk 数据为 PCM (silk-wasm)
+   */
+  private async decodeSilkToPcm(silkData: Buffer, sampleRate: number): Promise<Buffer | null> {
+    try {
+      let wasmPath: string
+      if (app.isPackaged) {
+        wasmPath = join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
+        if (!existsSync(wasmPath)) {
+          wasmPath = join(process.resourcesPath, 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
+        }
+      } else {
+        wasmPath = join(app.getAppPath(), 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
+      }
+
+      if (!existsSync(wasmPath)) {
+        console.error('[ChatService][Voice] silk.wasm not found at:', wasmPath)
+        return null
+      }
+
+      const silkWasm = require('silk-wasm')
+      if (!silkWasm || !silkWasm.decode) {
+        console.error('[ChatService][Voice] silk-wasm module invalid')
+        return null
+      }
+
+      const result = await silkWasm.decode(silkData, sampleRate)
+      return Buffer.from(result.data)
+    } catch (e) {
+      console.error('[ChatService][Voice] internal decode error:', e)
+      return null
+    }
+  }
+
+  /**
+   * 创建 WAV 文件 Buffer
+   */
+  private createWavBuffer(pcmData: Buffer, sampleRate: number = 24000, channels: number = 1): Buffer {
+    const pcmLength = pcmData.length
     const header = Buffer.alloc(44)
     header.write('RIFF', 0)
     header.writeUInt32LE(36 + pcmLength, 4)
@@ -2252,7 +2454,109 @@ class ChatService {
     header.writeUInt16LE(16, 34)
     header.write('data', 36)
     header.writeUInt32LE(pcmLength, 40)
-    return header
+    return Buffer.concat([header, pcmData])
+  }
+
+  async getVoiceTranscript(
+    sessionId: string,
+    msgId: string,
+    onPartial?: (text: string) => void
+  ): Promise<{ success: boolean; transcript?: string; error?: string }> {
+    const cacheKey = this.getVoiceCacheKey(sessionId, msgId)
+    const cached = this.voiceTranscriptCache.get(cacheKey)
+    if (cached) {
+      return { success: true, transcript: cached }
+    }
+
+    const pending = this.voiceTranscriptPending.get(cacheKey)
+    if (pending) {
+      return pending
+    }
+
+    const task = (async () => {
+      try {
+        let wavData = this.voiceWavCache.get(cacheKey)
+        if (!wavData) {
+          // 获取消息详情以拿到 createTime 和 serverId
+          let cTime: number | undefined
+          let sId: string | number | undefined
+          const msgResult = await this.getMessageById(sessionId, parseInt(msgId, 10))
+          if (msgResult.success && msgResult.message) {
+            cTime = msgResult.message.createTime
+            sId = msgResult.message.serverId
+          }
+
+          const voiceResult = await this.getVoiceData(sessionId, msgId, cTime, sId)
+          if (!voiceResult.success || !voiceResult.data) {
+            return { success: false, error: voiceResult.error || '语音解码失败' }
+          }
+          wavData = Buffer.from(voiceResult.data, 'base64')
+        }
+
+        const result = await voiceTranscribeService.transcribeWavBuffer(wavData, (text) => {
+          onPartial?.(text)
+        })
+        if (result.success && result.transcript) {
+          this.cacheVoiceTranscript(cacheKey, result.transcript)
+        }
+        return result
+      } catch (error) {
+        return { success: false, error: String(error) }
+      } finally {
+        this.voiceTranscriptPending.delete(cacheKey)
+      }
+    })()
+
+    this.voiceTranscriptPending.set(cacheKey, task)
+    return task
+  }
+
+
+
+  private getVoiceCacheKey(sessionId: string, msgId: string): string {
+    return `${sessionId}_${msgId}`
+  }
+
+  private cacheVoiceWav(cacheKey: string, wavData: Buffer): void {
+    this.voiceWavCache.set(cacheKey, wavData)
+    if (this.voiceWavCache.size > this.voiceCacheMaxEntries) {
+      const oldestKey = this.voiceWavCache.keys().next().value
+      if (oldestKey) this.voiceWavCache.delete(oldestKey)
+    }
+  }
+
+  /**
+   * 获取语音缓存文件路径
+   */
+  private getVoiceCacheFilePath(cacheKey: string): string {
+    const cachePath = this.configService.get('cachePath') as string | undefined
+    let baseDir: string
+    if (cachePath && cachePath.trim()) {
+      baseDir = join(cachePath, 'Voices')
+    } else {
+      const documentsPath = app.getPath('documents')
+      baseDir = join(documentsPath, 'WeFlow', 'Voices')
+    }
+    if (!existsSync(baseDir)) {
+      mkdirSync(baseDir, { recursive: true })
+    }
+    return join(baseDir, `${cacheKey}.wav`)
+  }
+
+  /**
+   * 保存语音到文件缓存
+   */
+  private saveVoiceCache(cacheKey: string, wavData: Buffer): void {
+    const filePath = this.getVoiceCacheFilePath(cacheKey)
+    writeFileSync(filePath, wavData)
+  }
+
+  private cacheVoiceTranscript(cacheKey: string, transcript: string): void {
+    this.voiceTranscriptCache.set(cacheKey, transcript)
+    if (this.voiceTranscriptCache.size > this.voiceCacheMaxEntries) {
+      const oldestKey = this.voiceTranscriptCache.keys().next().value
+      if (oldestKey) this.voiceTranscriptCache.delete(oldestKey)
+    }
   }
 
   async getMessageById(sessionId: string, localId: number): Promise<{ success: boolean; message?: Message; error?: string }> {

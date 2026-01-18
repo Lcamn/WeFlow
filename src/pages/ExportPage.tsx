@@ -16,6 +16,11 @@ interface ExportOptions {
   dateRange: { start: Date; end: Date } | null
   useAllTime: boolean
   exportAvatars: boolean
+  exportMedia: boolean
+  exportImages: boolean
+  exportVoices: boolean
+  exportEmojis: boolean
+  exportVoiceAsText: boolean
 }
 
 interface ExportResult {
@@ -46,7 +51,12 @@ function ExportPage() {
       end: new Date()
     },
     useAllTime: true,
-    exportAvatars: true
+    exportAvatars: true,
+    exportMedia: false,
+    exportImages: true,
+    exportVoices: true,
+    exportEmojis: true,
+    exportVoiceAsText: false
   })
 
   const loadSessions = useCallback(async () => {
@@ -146,6 +156,11 @@ function ExportPage() {
       const exportOptions = {
         format: options.format,
         exportAvatars: options.exportAvatars,
+        exportMedia: options.exportMedia,
+        exportImages: options.exportMedia && options.exportImages,
+        exportVoices: options.exportMedia && options.exportVoices,
+        exportEmojis: options.exportMedia && options.exportEmojis,
+        exportVoiceAsText: options.exportVoiceAsText,  // 独立于 exportMedia
         dateRange: options.useAllTime ? null : options.dateRange ? {
           start: Math.floor(options.dateRange.start.getTime() / 1000),
           // 将结束日期设置为当天的 23:59:59,以包含当天的所有消息
@@ -153,7 +168,7 @@ function ExportPage() {
         } : null
       }
 
-      if (options.format === 'chatlab' || options.format === 'chatlab-jsonl' || options.format === 'json') {
+      if (options.format === 'chatlab' || options.format === 'chatlab-jsonl' || options.format === 'json' || options.format === 'excel') {
         const result = await window.electronAPI.export.exportSessions(
           sessionList,
           exportFolder,
@@ -203,18 +218,54 @@ function ExportPage() {
     const year = calendarDate.getFullYear()
     const month = calendarDate.getMonth()
     const selectedDate = new Date(year, month, day)
+    // 设置时间为当天的开始或结束
+    selectedDate.setHours(selectingStart ? 0 : 23, selectingStart ? 0 : 59, selectingStart ? 0 : 59, selectingStart ? 0 : 999)
+
+    const now = new Date()
+    // 如果选择的日期晚于当前时间，限制为当前时间
+    if (selectedDate > now) {
+      selectedDate.setTime(now.getTime())
+    }
 
     if (selectingStart) {
-      setOptions({
-        ...options,
-        dateRange: options.dateRange ? { ...options.dateRange, start: selectedDate } : { start: selectedDate, end: new Date() }
-      })
+      // 选择开始日期
+      const currentEnd = options.dateRange?.end || new Date()
+      // 如果选择的开始日期晚于结束日期，则同时更新结束日期
+      if (selectedDate > currentEnd) {
+        const newEnd = new Date(selectedDate)
+        newEnd.setHours(23, 59, 59, 999)
+        // 确保结束日期也不晚于当前时间
+        if (newEnd > now) {
+          newEnd.setTime(now.getTime())
+        }
+        setOptions({
+          ...options,
+          dateRange: { start: selectedDate, end: newEnd }
+        })
+      } else {
+        setOptions({
+          ...options,
+          dateRange: options.dateRange ? { ...options.dateRange, start: selectedDate } : { start: selectedDate, end: new Date() }
+        })
+      }
       setSelectingStart(false)
     } else {
-      setOptions({
-        ...options,
-        dateRange: options.dateRange ? { ...options.dateRange, end: selectedDate } : { start: new Date(), end: selectedDate }
-      })
+      // 选择结束日期
+      const currentStart = options.dateRange?.start || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+      // 如果选择的结束日期早于开始日期，则同时更新开始日期
+      if (selectedDate < currentStart) {
+        const newStart = new Date(selectedDate)
+        newStart.setHours(0, 0, 0, 0)
+        setOptions({
+          ...options,
+          dateRange: { start: newStart, end: selectedDate }
+        })
+      } else {
+        setOptions({
+          ...options,
+          dateRange: options.dateRange ? { ...options.dateRange, end: selectedDate } : { start: new Date(), end: selectedDate }
+        })
+      }
       setSelectingStart(true)
     }
   }
@@ -343,16 +394,103 @@ function ExportPage() {
           </div>
 
           <div className="setting-section">
-            <h3>导出头像</h3>
-            <div className="time-options">
-              <label className="checkbox-item">
+            <h3>媒体文件</h3>
+            <p className="setting-subtitle">导出图片/语音/表情并在记录内写入相对路径</p>
+            <div className="media-options-card">
+              <div className="media-switch-row">
+                <div className="media-switch-info">
+                  <span className="media-switch-title">导出媒体文件</span>
+                  <span className="media-switch-desc">会创建子文件夹并保存媒体资源</span>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={options.exportMedia}
+                    onChange={e => setOptions({ ...options, exportMedia: e.target.checked })}
+                  />
+                  <span className="slider"></span>
+                </label>
+              </div>
+
+              <div className="media-option-divider"></div>
+
+              <label className={`media-checkbox-row ${!options.exportMedia ? 'disabled' : ''}`}>
+                <div className="media-checkbox-info">
+                  <span className="media-checkbox-title">图片</span>
+                  <span className="media-checkbox-desc">已有文件直接复制，缺失时尝试解密</span>
+                </div>
                 <input
                   type="checkbox"
-                  checked={options.exportAvatars}
-                  onChange={e => setOptions({ ...options, exportAvatars: e.target.checked })}
+                  checked={options.exportImages}
+                  disabled={!options.exportMedia}
+                  onChange={e => setOptions({ ...options, exportImages: e.target.checked })}
                 />
-                <span>导出头像图片</span>
               </label>
+
+              <div className="media-option-divider"></div>
+
+              <label className={`media-checkbox-row ${!options.exportMedia ? 'disabled' : ''}`}>
+                <div className="media-checkbox-info">
+                  <span className="media-checkbox-title">语音</span>
+                  <span className="media-checkbox-desc">缺失时会解码生成 MP3</span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={options.exportVoices}
+                  disabled={!options.exportMedia}
+                  onChange={e => setOptions({ ...options, exportVoices: e.target.checked })}
+                />
+              </label>
+
+              <div className="media-option-divider"></div>
+
+              <label className="media-checkbox-row">
+                <div className="media-checkbox-info">
+                  <span className="media-checkbox-title">语音转文字</span>
+                  <span className="media-checkbox-desc">将语音消息转换为文字导出（不导出语音文件）</span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={options.exportVoiceAsText}
+                  onChange={e => setOptions({ ...options, exportVoiceAsText: e.target.checked })}
+                />
+              </label>
+
+              <div className="media-option-divider"></div>
+
+              <label className={`media-checkbox-row ${!options.exportMedia ? 'disabled' : ''}`}>
+                <div className="media-checkbox-info">
+                  <span className="media-checkbox-title">表情</span>
+                  <span className="media-checkbox-desc">本地无缓存时尝试下载</span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={options.exportEmojis}
+                  disabled={!options.exportMedia}
+                  onChange={e => setOptions({ ...options, exportEmojis: e.target.checked })}
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="setting-section">
+            <h3>头像</h3>
+            <p className="setting-subtitle">可选导出头像索引，关闭则不下载头像</p>
+            <div className="media-options-card">
+              <div className="media-switch-row">
+                <div className="media-switch-info">
+                  <span className="media-switch-title">导出头像</span>
+                  <span className="media-switch-desc">用于展示发送者头像，可能会读取或下载头像文件</span>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={options.exportAvatars}
+                    onChange={e => setOptions({ ...options, exportAvatars: e.target.checked })}
+                  />
+                  <span className="slider"></span>
+                </label>
+              </div>
             </div>
           </div>
 
@@ -462,6 +600,9 @@ function ExportPage() {
         <div className="export-overlay" onClick={() => setShowDatePicker(false)}>
           <div className="date-picker-modal" onClick={e => e.stopPropagation()}>
             <h3>选择时间范围</h3>
+            <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '8px 0 16px 0' }}>
+              点击选择开始和结束日期，系统会自动调整确保时间顺序正确
+            </p>
             <div className="quick-select">
               <button
                 className="quick-btn"
@@ -556,12 +697,16 @@ function ExportPage() {
                   const isStart = options.dateRange?.start.toDateString() === currentDate.toDateString()
                   const isEnd = options.dateRange?.end.toDateString() === currentDate.toDateString()
                   const isInRange = options.dateRange && currentDate >= options.dateRange.start && currentDate <= options.dateRange.end
+                  const today = new Date()
+                  today.setHours(0, 0, 0, 0)
+                  const isFuture = currentDate > today
 
                   return (
                     <div
                       key={day}
-                      className={`calendar-day ${isStart ? 'start' : ''} ${isEnd ? 'end' : ''} ${isInRange ? 'in-range' : ''}`}
-                      onClick={() => handleDateSelect(day)}
+                      className={`calendar-day ${isStart ? 'start' : ''} ${isEnd ? 'end' : ''} ${isInRange ? 'in-range' : ''} ${isFuture ? 'disabled' : ''}`}
+                      onClick={() => !isFuture && handleDateSelect(day)}
+                      style={{ cursor: isFuture ? 'not-allowed' : 'pointer', opacity: isFuture ? 0.3 : 1 }}
                     >
                       {day}
                     </div>
