@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { useThemeStore, themes } from '../stores/themeStore'
 import { useAnalyticsStore } from '../stores/analyticsStore'
@@ -484,15 +484,8 @@ function SettingsPage() {
       await configService.setTranscribeLanguages(transcribeLanguages)
       await configService.setOnboardingDone(true)
 
-      showMessage('配置保存成功，正在测试连接...', true)
-      const result = await window.electronAPI.wcdb.testConnection(dbPath, decryptKey, wxid)
-
-      if (result.success) {
-        setDbConnected(true, dbPath)
-        showMessage('配置保存成功！数据库连接正常', true)
-      } else {
-        showMessage(result.error || '数据库连接失败，请检查配置', false)
-      }
+      // 保存按钮只负责持久化配置，不做连接测试/重连，避免影响聊天页的活动连接
+      showMessage('配置保存成功', true)
     } catch (e) {
       showMessage(`保存配置失败: ${e}`, false)
     } finally {
