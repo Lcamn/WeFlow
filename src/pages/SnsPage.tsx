@@ -111,7 +111,7 @@ export default function SnsPage() {
     }, [offset, selectedUsernames, searchKeyword, startDate, endDate])
 
     // 获取联系人列表
-    const loadContacts = async () => {
+    const loadContacts = useCallback(async () => {
         setContactsLoading(true)
         try {
             const result = await window.electronAPI.chat.getSessions()
@@ -171,11 +171,26 @@ export default function SnsPage() {
         } finally {
             setContactsLoading(false)
         }
-    }
+    }, [])
 
     useEffect(() => {
         loadContacts()
-    }, [])
+    }, [loadContacts])
+
+    useEffect(() => {
+        const handleChange = () => {
+            setPosts([])
+            setHasMore(true)
+            setHasNewer(false)
+            setSelectedUsernames([])
+            setSearchKeyword('')
+            setJumpTargetDate(null)
+            loadContacts()
+            loadPosts({ reset: true })
+        }
+        window.addEventListener('wxid-changed', handleChange as EventListener)
+        return () => window.removeEventListener('wxid-changed', handleChange as EventListener)
+    }, [loadContacts, loadPosts])
 
     useEffect(() => {
         loadPosts(true)
