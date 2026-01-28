@@ -62,6 +62,7 @@ function SettingsPage() {
   const [exportDefaultMedia, setExportDefaultMedia] = useState(false)
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(true)
   const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
+  const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(2)
 
   const [isLoading, setIsLoadingState] = useState(false)
   const [isTesting, setIsTesting] = useState(false)
@@ -139,6 +140,7 @@ function SettingsPage() {
       const savedExportDefaultMedia = await configService.getExportDefaultMedia()
       const savedExportDefaultVoiceAsText = await configService.getExportDefaultVoiceAsText()
       const savedExportDefaultExcelCompactColumns = await configService.getExportDefaultExcelCompactColumns()
+      const savedExportDefaultConcurrency = await configService.getExportDefaultConcurrency()
 
       if (savedPath) setDbPath(savedPath)
       if (savedWxid) setWxid(savedWxid)
@@ -166,6 +168,7 @@ function SettingsPage() {
       setExportDefaultMedia(savedExportDefaultMedia ?? false)
       setExportDefaultVoiceAsText(savedExportDefaultVoiceAsText ?? true)
       setExportDefaultExcelCompactColumns(savedExportDefaultExcelCompactColumns ?? true)
+      setExportDefaultConcurrency(savedExportDefaultConcurrency ?? 2)
 
       // 如果语言列表为空，保存默认值
       if (!savedTranscribeLanguages || savedTranscribeLanguages.length === 0) {
@@ -1111,6 +1114,32 @@ function SettingsPage() {
             <span className="switch-slider" />
           </label>
         </div>
+      </div>
+
+      
+      <div className="form-group">
+        <label>{'\u9ed8\u8ba4\u5bfc\u51fa\u5e76\u53d1\u6570'}</label>
+        <span className="form-hint">{'\u540c\u65f6\u5bfc\u51fa\u7684\u4f1a\u8bdd\u6570\u91cf\uff0c\u5efa\u8bae 1-3'}</span>
+        <input
+          type="number"
+          min={1}
+          max={6}
+          value={exportDefaultConcurrency}
+          onChange={(e) => {
+            const value = Number(e.target.value)
+            if (Number.isNaN(value)) {
+              setExportDefaultConcurrency(1)
+              return
+            }
+            setExportDefaultConcurrency(value)
+          }}
+          onBlur={async () => {
+            const clamped = Math.max(1, Math.min(Math.floor(exportDefaultConcurrency || 1), 6))
+            setExportDefaultConcurrency(clamped)
+            await configService.setExportDefaultConcurrency(clamped)
+            showMessage(`\u5df2\u66f4\u65b0\u5bfc\u51fa\u5e76\u53d1\u6570\u4e3a ${clamped}`, true)
+          }}
+        />
       </div>
 
       <div className="form-group">
