@@ -213,19 +213,147 @@ class ExportService {
   }
 
   /**
-   * 从 DLL 获取群成员的群昵称
+   * 通过 contact.chat_room.ext_buffer 解析群昵称（纯 SQL）
    */
-  async getGroupNicknamesForRoom(chatroomId: string): Promise<Map<string, string>> {
+  async getGroupNicknamesForRoom(chatroomId: string, candidates: string[] = []): Promise<Map<string, string>> {
     try {
-      const result = await wcdbService.getGroupNicknames(chatroomId)
-      if (result.success && result.nicknames) {
-        return new Map(Object.entries(result.nicknames))
+      const escapedChatroomId = chatroomId.replace(/'/g, "''")
+      const sql = `SELECT ext_buffer FROM chat_room WHERE username='${escapedChatroomId}' LIMIT 1`
+      const result = await wcdbService.execQuery('contact', null, sql)
+      if (!result.success || !result.rows || result.rows.length === 0) {
+        return new Map<string, string>()
       }
-      return new Map<string, string>()
+
+      const extBuffer = this.decodeExtBuffer((result.rows[0] as any).ext_buffer)
+      if (!extBuffer) return new Map<string, string>()
+      return this.parseGroupNicknamesFromExtBuffer(extBuffer, candidates)
     } catch (e) {
       console.error('getGroupNicknamesForRoom error:', e)
       return new Map<string, string>()
     }
+  }
+
+  private decodeExtBuffer(value: unknown): Buffer | null {
+    if (!value) return null
+    if (Buffer.isBuffer(value)) return value
+    if (value instanceof Uint8Array) return Buffer.from(value)
+
+    if (typeof value === 'string') {
+      const raw = value.trim()
+      if (!raw) return null
+
+      if (this.looksLikeHex(raw)) {
+        try { return Buffer.from(raw, 'hex') } catch { }
+      }
+      if (this.looksLikeBase64(raw)) {
+        try { return Buffer.from(raw, 'base64') } catch { }
+      }
+
+      try { return Buffer.from(raw, 'hex') } catch { }
+      try { return Buffer.from(raw, 'base64') } catch { }
+      try { return Buffer.from(raw, 'utf8') } catch { }
+      return null
+    }
+
+    return null
+  }
+
+  private readVarint(buffer: Buffer, offset: number, limit: number = buffer.length): { value: number; next: number } | null {
+    let value = 0
+    let shift = 0
+    let pos = offset
+    while (pos < limit && shift <= 53) {
+      const byte = buffer[pos]
+      value += (byte & 0x7f) * Math.pow(2, shift)
+      pos += 1
+      if ((byte & 0x80) === 0) return { value, next: pos }
+      shift += 7
+    }
+    return null
+  }
+
+  private isLikelyGroupMemberId(value: string): boolean {
+    const id = String(value || '').trim()
+    if (!id) return false
+    if (id.includes('@chatroom')) return false
+    if (id.length < 4 || id.length > 80) return false
+    return /^[A-Za-z][A-Za-z0-9_.@-]*$/.test(id)
+  }
+
+  private parseGroupNicknamesFromExtBuffer(buffer: Buffer, candidates: string[] = []): Map<string, string> {
+    const nicknameMap = new Map<string, string>()
+    if (!buffer || buffer.length === 0) return nicknameMap
+
+    try {
+      const candidateSet = new Set(this.buildGroupNicknameIdCandidates(candidates).map((id) => id.toLowerCase()))
+
+      for (let i = 0; i < buffer.length - 2; i += 1) {
+        if (buffer[i] !== 0x0a) continue
+
+        const idLenInfo = this.readVarint(buffer, i + 1)
+        if (!idLenInfo) continue
+        const idLen = idLenInfo.value
+        if (!Number.isFinite(idLen) || idLen <= 0 || idLen > 96) continue
+
+        const idStart = idLenInfo.next
+        const idEnd = idStart + idLen
+        if (idEnd > buffer.length) continue
+
+        const memberId = buffer.toString('utf8', idStart, idEnd).trim()
+        if (!this.isLikelyGroupMemberId(memberId)) continue
+
+        const memberIdLower = memberId.toLowerCase()
+        if (candidateSet.size > 0 && !candidateSet.has(memberIdLower)) {
+          i = idEnd - 1
+          continue
+        }
+
+        const cursor = idEnd
+        if (cursor >= buffer.length || buffer[cursor] !== 0x12) {
+          i = idEnd - 1
+          continue
+        }
+
+        const nickLenInfo = this.readVarint(buffer, cursor + 1)
+        if (!nickLenInfo) {
+          i = idEnd - 1
+          continue
+        }
+        const nickLen = nickLenInfo.value
+        if (!Number.isFinite(nickLen) || nickLen <= 0 || nickLen > 128) {
+          i = idEnd - 1
+          continue
+        }
+
+        const nickStart = nickLenInfo.next
+        const nickEnd = nickStart + nickLen
+        if (nickEnd > buffer.length) {
+          i = idEnd - 1
+          continue
+        }
+
+        const rawNick = buffer.toString('utf8', nickStart, nickEnd)
+        const nickname = this.normalizeGroupNickname(rawNick.replace(/[\x00-\x1F\x7F]/g, '').trim())
+        if (!nickname) {
+          i = nickEnd - 1
+          continue
+        }
+
+        const aliases = this.buildGroupNicknameIdCandidates([memberId])
+        for (const alias of aliases) {
+          if (!alias) continue
+          if (!nicknameMap.has(alias)) nicknameMap.set(alias, nickname)
+          const lower = alias.toLowerCase()
+          if (!nicknameMap.has(lower)) nicknameMap.set(lower, nickname)
+        }
+
+        i = nickEnd - 1
+      }
+    } catch (e) {
+      console.error('Failed to parse chat_room.ext_buffer in exportService:', e)
+    }
+
+    return nicknameMap
   }
 
   /**
@@ -329,6 +457,47 @@ class ExportService {
     return cleaned
   }
 
+  private buildGroupNicknameIdCandidates(values: Array<string | undefined | null>): string[] {
+    const set = new Set<string>()
+    for (const rawValue of values) {
+      const raw = String(rawValue || '').trim()
+      if (!raw) continue
+      set.add(raw)
+      const cleaned = this.cleanAccountDirName(raw)
+      if (cleaned && cleaned !== raw) set.add(cleaned)
+    }
+    return Array.from(set)
+  }
+
+  private resolveGroupNicknameByCandidates(groupNicknamesMap: Map<string, string>, candidates: Array<string | undefined | null>): string {
+    const idCandidates = this.buildGroupNicknameIdCandidates(candidates)
+    if (idCandidates.length === 0) return ''
+
+    for (const id of idCandidates) {
+      const exact = this.normalizeGroupNickname(groupNicknamesMap.get(id) || '')
+      if (exact) return exact
+      const lower = this.normalizeGroupNickname(groupNicknamesMap.get(id.toLowerCase()) || '')
+      if (lower) return lower
+    }
+
+    for (const id of idCandidates) {
+      const lower = id.toLowerCase()
+      let found = ''
+      let matched = 0
+      for (const [key, value] of groupNicknamesMap.entries()) {
+        if (String(key || '').toLowerCase() !== lower) continue
+        const normalized = this.normalizeGroupNickname(value || '')
+        if (!normalized) continue
+        found = normalized
+        matched += 1
+        if (matched > 1) return ''
+      }
+      if (matched === 1 && found) return found
+    }
+
+    return ''
+  }
+
   /**
    * 根据用户偏好获取显示名称
    */
@@ -377,12 +546,12 @@ class ExportService {
     const resolveName = async (username: string): Promise<string> => {
       // 当前用户自己
       if (myWxid && (username === myWxid || username === cleanedMyWxid)) {
-        const groupNick = groupNicknamesMap.get(username) || groupNicknamesMap.get(username.toLowerCase())
+        const groupNick = this.resolveGroupNicknameByCandidates(groupNicknamesMap, [username, myWxid, cleanedMyWxid])
         if (groupNick) return groupNick
         return '我'
       }
       // 群昵称
-      const groupNick = groupNicknamesMap.get(username) || groupNicknamesMap.get(username.toLowerCase())
+      const groupNick = this.resolveGroupNicknameByCandidates(groupNicknamesMap, [username])
       if (groupNick) return groupNick
       // 联系人名称
       return getContactName(username)
@@ -1992,17 +2161,22 @@ class ExportService {
       }
 
       // ========== 获取群昵称并更新到 memberSet ==========
+      const groupNicknameCandidates = isGroup
+        ? this.buildGroupNicknameIdCandidates([
+          ...Array.from(collected.memberSet.keys()),
+          ...allMessages.map(msg => msg.senderUsername),
+          cleanedMyWxid
+        ])
+        : []
       const groupNicknamesMap = isGroup
-        ? await this.getGroupNicknamesForRoom(sessionId)
+        ? await this.getGroupNicknamesForRoom(sessionId, groupNicknameCandidates)
         : new Map<string, string>()
 
       // 将群昵称更新到 memberSet 中
       if (isGroup && groupNicknamesMap.size > 0) {
         for (const [username, info] of collected.memberSet) {
           // 尝试多种方式查找群昵称（支持大小写）
-          const groupNickname = groupNicknamesMap.get(username) 
-            || groupNicknamesMap.get(username.toLowerCase())
-            || ''
+          const groupNickname = this.resolveGroupNicknameByCandidates(groupNicknamesMap, [username]) || ''
           if (groupNickname) {
             info.member.groupNickname = groupNickname
           }
@@ -2117,8 +2291,8 @@ class ExportService {
         }
 
         // 如果 memberInfo 中没有群昵称，尝试从 groupNicknamesMap 获取
-        const groupNickname = memberInfo.groupNickname 
-          || (isGroup ? (groupNicknamesMap.get(msg.senderUsername) || groupNicknamesMap.get(msg.senderUsername?.toLowerCase()) || '') : '')
+        const groupNickname = memberInfo.groupNickname
+          || (isGroup ? this.resolveGroupNicknameByCandidates(groupNicknamesMap, [msg.senderUsername]) : '')
           || ''
 
         // 确定消息内容
@@ -2463,8 +2637,15 @@ class ExportService {
       }
 
       // ========== 预加载群昵称（用于名称显示偏好） ==========
+      const groupNicknameCandidates = isGroup
+        ? this.buildGroupNicknameIdCandidates([
+          ...Array.from(senderUsernames.values()),
+          ...collected.rows.map(msg => msg.senderUsername),
+          cleanedMyWxid
+        ])
+        : []
       const groupNicknamesMap = isGroup
-        ? await this.getGroupNicknamesForRoom(sessionId)
+        ? await this.getGroupNicknamesForRoom(sessionId, groupNicknameCandidates)
         : new Map<string, string>()
 
       // ========== 阶段3：构建消息列表 ==========
@@ -2519,7 +2700,7 @@ class ExportService {
           ? contact.contact.nickName
           : (senderInfo.displayName || senderWxid)
         const senderRemark = contact.success && contact.contact?.remark ? contact.contact.remark : ''
-        const senderGroupNickname = this.normalizeGroupNickname(groupNicknamesMap.get(senderWxid?.toLowerCase() || '') || '')
+        const senderGroupNickname = this.resolveGroupNicknameByCandidates(groupNicknamesMap, [senderWxid])
 
         // 使用用户偏好的显示名称
         const senderDisplayName = this.getPreferredDisplayName(
@@ -2565,7 +2746,7 @@ class ExportService {
         ? sessionContact.contact.remark
         : ''
       const sessionGroupNickname = isGroup
-        ? this.normalizeGroupNickname(groupNicknamesMap.get(sessionId.toLowerCase()) || '')
+        ? this.resolveGroupNicknameByCandidates(groupNicknamesMap, [sessionId])
         : ''
 
       // 使用用户偏好的显示名称
@@ -2805,8 +2986,14 @@ class ExportService {
       }
 
       // 预加载群昵称 (仅群聊且完整列模式)
+      const groupNicknameCandidates = (isGroup && !useCompactColumns)
+        ? this.buildGroupNicknameIdCandidates([
+          ...collected.rows.map(msg => msg.senderUsername),
+          cleanedMyWxid
+        ])
+        : []
       const groupNicknamesMap = (isGroup && !useCompactColumns)
-        ? await this.getGroupNicknamesForRoom(sessionId)
+        ? await this.getGroupNicknamesForRoom(sessionId, groupNicknameCandidates)
         : new Map<string, string>()
 
 
@@ -2960,7 +3147,7 @@ class ExportService {
 
         // 获取群昵称 (仅群聊且完整列模式)
         if (isGroup && !useCompactColumns && senderWxid) {
-          senderGroupNickname = this.normalizeGroupNickname(groupNicknamesMap.get(senderWxid.toLowerCase()) || '')
+          senderGroupNickname = this.resolveGroupNicknameByCandidates(groupNicknamesMap, [senderWxid])
         }
 
 
@@ -3170,8 +3357,15 @@ class ExportService {
       await this.preloadContacts(senderUsernames, contactCache)
 
       // 获取群昵称（用于转账描述等）
+      const groupNicknameCandidates = isGroup
+        ? this.buildGroupNicknameIdCandidates([
+          ...Array.from(senderUsernames.values()),
+          ...collected.rows.map(msg => msg.senderUsername),
+          cleanedMyWxid
+        ])
+        : []
       const groupNicknamesMap = isGroup
-        ? await this.getGroupNicknamesForRoom(sessionId)
+        ? await this.getGroupNicknamesForRoom(sessionId, groupNicknameCandidates)
         : new Map<string, string>()
 
       const sortedMessages = collected.rows.sort((a, b) => a.createTime - b.createTime)
